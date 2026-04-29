@@ -12,7 +12,7 @@ from transnumber import Transnum
 from sppc import SPPC_select, similarity_select
 from baseline1 import Anomaly_detection
 from baseline2 import Train
-from Text_trans2 import ATM
+from Text_translation_version2 import ATM
 from extract import Extract
 from find_categories import Find_categories
 from security_check import security_check
