@@ -1,161 +1,186 @@
 import os
 import pickle
 import random
-
 import numpy as np
+
 import torch
 import torch.nn as nn
-from sklearn.metrics.pairwise import cosine_similarity
+import torch.nn.functional as F
+
 from torch.utils.data import DataLoader
+from sklearn.cluster import KMeans
 
-from models1 import TransformerAutoencoder, TimeSeriesDataset1
+from models1 import TimeSeriesDataset1  
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+# Device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-
-def pad(vocab_size, sequences):
-    for sequence in sequences:
-        if len(sequence) < 40:
-            sequence.extend([vocab_size - 1] * (40 - len(sequence)))
-    return sequences
-
-
-def remove_pad(lst):
-    for sublist in lst:
-        while sublist and sublist[-1] == 0:
-            sublist.pop()
-    return lst
-
-
-def setup_seed(seed):
+# Reproducibility
+def setup_seed(seed=2024):
+    random.seed(seed)
+    np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    np.random.seed(seed)
-    random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
 
-    os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.backends.cudnn.enabled = False
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
-
-
-def simi_pad(sequences):
-    for sequence in sequences:
-        if len(sequence) < 40:
-            sequence.extend([0] * (40 - len(sequence)))
+# Padding
+def pad(vocab_size, sequences, max_len=40):
+    for seq in sequences:
+        if len(seq) < max_len:
+            seq.extend([vocab_size - 1] * (max_len - len(seq)))
     return sequences
 
+# Data Loader
+def make_data(vocab_size, data_file, batch_size):
+    with open(data_file, 'rb') as f:
+        sequences = pickle.load(f)
 
-def make_data(vocab_size, data_file='reduced_flattened_useful_us_trn_instance_10.pkl', batch_size=64):
-    with open(data_file, 'rb') as file:
-        sequence = pickle.load(file)
-    data = pad(vocab_size, sequence)
-    data = np.array(data)
-    dataset = TimeSeriesDataset1(vocab_size, data)
-    data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
-    return data_loader
+    sequences = pad(vocab_size, sequences)
+    sequences = np.array(sequences)
 
+    dataset = TimeSeriesDataset1(vocab_size, sequences)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-class TransformerAutoencoder(nn.Module):
-    def __init__(self, vocab_size, d_model=512, nhead=8, num_encoder_layers=2, num_decoder_layers=2):
+# Model (Encoder + Projection)
+class TransformerEncoderCL(nn.Module):
+    def __init__(self, vocab_size, d_model=256, nhead=4, num_layers=2, proj_dim=128):
         super().__init__()
-        self.d_model = d_model
+
         self.embedding = nn.Embedding(vocab_size, d_model)
 
         encoder_layer = nn.TransformerEncoderLayer(d_model, nhead, batch_first=True)
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_encoder_layers)
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers)
 
-        decoder_layer = nn.TransformerDecoderLayer(d_model, nhead, batch_first=True)
-        self.decoder = nn.TransformerDecoder(decoder_layer, num_decoder_layers)
+        self.projection = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, proj_dim)
+        )
 
-        self.output_layer = nn.Linear(d_model, vocab_size)
+    def forward(self, src, padding_mask=None):
+        x = self.embedding(src)
+        memory = self.encoder(x, src_key_padding_mask=padding_mask)
 
-        self._init_weights()
+        pooled = memory.mean(dim=1)   # [B, D]
+        z = self.projection(pooled)   # [B, proj_dim]
 
-    def _init_weights(self):
-        for p in self.parameters():
-            if p.dim() > 1:
-                nn.init.xavier_uniform_(p)
+        return z
 
-    def forward(self, src, src_key_padding_mask=None):
-        src_emb = self.embedding(src)
-        memory = self.encoder(src_emb, src_key_padding_mask=src_key_padding_mask)
-        tgt_emb = src_emb
+# Augmentations
+def augment_sequence(seq, vocab_size, mask_prob=0.1, drop_prob=0.1):
+    seq = seq.clone()
 
-        return memory
+    # Masking
+    mask = torch.rand(seq.shape, device=seq.device) < mask_prob
+    seq[mask] = vocab_size - 1
 
+    # Drop tokens
+    keep = torch.rand(seq.shape, device=seq.device) > drop_prob
+    seq = seq * keep
 
-def SPPC_select(dataset, ori_env, vocab_size, threshold):
-    setup_seed(2024)
-    num_epochs = 15
+    return seq
+
+def create_views(src, vocab_size):
+    v1 = augment_sequence(src, vocab_size)
+    v2 = augment_sequence(src, vocab_size)
+    return v1, v2
+
+# InfoNCE Loss (SimCLR)
+def info_nce_loss(z1, z2, temperature=0.5):
+    B = z1.shape[0]
+
+    z1 = F.normalize(z1, dim=1)
+    z2 = F.normalize(z2, dim=1)
+
+    z = torch.cat([z1, z2], dim=0)  # [2B, D]
+
+    sim = torch.matmul(z, z.T)
+
+    mask = torch.eye(2 * B, device=z.device).bool()
+    sim = sim.masked_fill(mask, -1e9)
+
+    sim = sim / temperature
+
+    labels = torch.arange(B, device=z.device)
+    labels = torch.cat([labels + B, labels])
+
+    loss = F.cross_entropy(sim, labels)
+    return loss
+
+# Clustering Selection
+def cluster_select(embeddings, sequences, num_clusters):
+    kmeans = KMeans(n_clusters=num_clusters, random_state=0)
+    labels = kmeans.fit_predict(embeddings)
+
+    selected_indices = []
+
+    for cid in range(num_clusters):
+        idx = np.where(labels == cid)[0]
+        if len(idx) == 0:
+            continue
+
+        centroid = kmeans.cluster_centers_[cid]
+        cluster_emb = embeddings[idx]
+
+        distances = np.linalg.norm(cluster_emb - centroid, axis=1)
+        best_idx = idx[np.argmin(distances)]
+
+        selected_indices.append(best_idx)
+
+    return [sequences[i] for i in selected_indices]
+
+# Main Compression Function
+def CLUSTER_select(dataset, ori_env, vocab_size, num_clusters=50, epochs=5):
+    setup_seed()
+
     for day in range(7):
+        print(f"\n Processing Day {day}")
 
-        model = TransformerAutoencoder(vocab_size, d_model=256, nhead=4, num_encoder_layers=2, num_decoder_layers=2)
-        model = model.to(device)
-        model_name = f"IoT_model/Transformer_{dataset}_{ori_env}_{num_epochs}epoch.pth"
-        model.load_state_dict(torch.load(model_name))
-        day_select_file = f'IoT_data/{dataset}/{ori_env}/trn_day_{day}.pkl'
+        file_path = f'IoT_data/{dataset}/{ori_env}/trn_day_{day}.pkl'
 
-        with open(day_select_file, 'rb') as file2:
-            text_collection = pickle.load(file2)
-        print(len(text_collection))
-        train_loader = make_data(vocab_size, data_file=day_select_file, batch_size=len(text_collection))
-        criterion = nn.CrossEntropyLoss()
-        optimizer = torch.optim.Adam(model.parameters())
+        with open(file_path, 'rb') as f:
+            text_collection = pickle.load(f)
 
-        for batch in train_loader:
-            src, padding_mask, _ = batch
-            src = src.to(device)
-            padding_mask = padding_mask.to(device)
-            memory = model(src, src_key_padding_mask=padding_mask)
-            memories = memory.cpu().detach().numpy()
-            memories_2D = memories.reshape(memories.shape[0], memories.shape[1] * memories.shape[2])
+        loader = make_data(vocab_size, file_path, batch_size=len(text_collection))
 
-        similarity_matrix = cosine_similarity(memories_2D)
+        model = TransformerEncoderCL(vocab_size).to(device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
-        to_remove = set()
-        unique_indices = []
+    
+        # Train (Contrastive)
+        model.train()
+        for epoch in range(epochs):
+            for src, padding_mask, _ in loader:
+                src = src.to(device)
 
-        for i in range(len(text_collection)):
-            if i not in to_remove:
-                unique_indices.append(i)
-                for j in range(i + 1, len(text_collection)):
-                    if similarity_matrix[i, j] > threshold:
-                        to_remove.add(j)
+                v1, v2 = create_views(src, vocab_size)
 
-        deduplicated_collection = [text_collection[i] for i in unique_indices]
+                z1 = model(v1, padding_mask)
+                z2 = model(v2, padding_mask)
 
-        print(deduplicated_collection)
-        print(len(deduplicated_collection))
+                loss = info_nce_loss(z1, z2)
 
-        with open(f'IoT_data/{dataset}/{ori_env}/trn_day_{day}_SPPC_th={threshold}.pkl', 'wb') as f3:
-            pickle.dump(deduplicated_collection, f3)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
 
+            print(f"Epoch {epoch+1}, Loss: {loss.item():.4f}")
 
-def similarity_select(dataset, ori_env, threshold):
-    for day in range(7):
-        with open(f'IoT_data/{dataset}/{ori_env}/trn_day_{day}.pkl', 'rb') as file3:
-            text_collection = pickle.load(file3)
+    
+        # Inference (NO AUGMENT)
+        model.eval()
+        with torch.no_grad():
+            for src, padding_mask, _ in loader:
+                src = src.to(device)
+                z = model(src, padding_mask)
+                embeddings = z.cpu().numpy()
 
-        simi_pad(text_collection)
-        similarity_matrix = cosine_similarity(text_collection)
-        remove_pad(text_collection)
-        to_remove = set()
-        unique_indices = []
+        
+        # Clustering Compression
+        selected = cluster_select(embeddings, text_collection, num_clusters)
 
-        for i in range(len(text_collection)):
-            if i not in to_remove:
-                unique_indices.append(i)
-                for j in range(i + 1, len(text_collection)):
-                    if similarity_matrix[i, j] > threshold:
-                        to_remove.add(j)
+        print(f"Original: {len(text_collection)} → Compressed: {len(selected)}")
 
-        deduplicated_collection = [text_collection[i] for i in unique_indices]
-        print(deduplicated_collection)
-        print(len(deduplicated_collection))
-
-        with open(f'IoT_data/{dataset}/{ori_env}/trn_day_{day}_similarity_th={threshold}.pkl', 'wb') as f3:
-            pickle.dump(deduplicated_collection, f3)
+        save_path = f'IoT_data/{dataset}/{ori_env}/trn_day_{day}_CLUSTER.pkl'
+        with open(save_path, 'wb') as f:
+            pickle.dump(selected, f)
