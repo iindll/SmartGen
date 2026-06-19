@@ -142,13 +142,10 @@ class TimeSeriesDataset2(Dataset):
     def __getitem__(self, index):
         sample = self.data[index]
 
-        device_control = sample.reshape(10, 4).T[3]
-        mask = (device_control == self.vocab_size - 1)
-        mask_v = (device_control != self.vocab_size - 1)
+        mask = (sample == self.vocab_size - 1)
+        mask_v = (sample != self.vocab_size - 1)
 
-        encoder_input = device_control
-
-        encoder_input = torch.from_numpy(encoder_input)
+        encoder_input = torch.from_numpy(sample)
 
         return encoder_input, mask, mask_v
 
@@ -164,7 +161,7 @@ class TimeSeriesDataset3(Dataset):
     def __getitem__(self, index):
         sample = self.data[index]
 
-        device_control = sample.reshape(10, 4).T[1]
+        encoder_input = torch.from_numpy(sample)
         mask = (device_control == self.vocab_size - 1)
         mask_v = (device_control != self.vocab_size - 1)
 
@@ -186,7 +183,7 @@ class TimeSeriesDataset4(Dataset):
     def __getitem__(self, index):
         sample = self.data[index]
 
-        device_control = sample.reshape(10, 4).T[2]
+        encoder_input = torch.from_numpy(sample)
         mask = (device_control == self.vocab_size - 1)
         mask_v = (device_control != self.vocab_size - 1)
 
