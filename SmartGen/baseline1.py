@@ -1,7 +1,6 @@
 import os
 import pickle
 import random
-
 import numpy as np
 import torch
 import torch.nn as nn
@@ -11,16 +10,10 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import (accuracy_score, recall_score,
                              precision_score, confusion_matrix)
 from torch.utils.data import DataLoader
-
 from models1 import TimeSeriesDataset2, TimeSeriesDataset3, TimeSeriesDataset4
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 vocab_dic = {"an": 141, "fr": 223, "us": 269, "sp": 235}
-
-
-# ══════════════════════════════════════════════════════════════
-# Utilities
-# ══════════════════════════════════════════════════════════════
 
 def setup_seed(seed=2024):
     torch.manual_seed(seed)
@@ -80,10 +73,6 @@ def make_data(new_env, vocab_size, data_file, batch_size=32, shuffle=False):
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
 
 
-# ══════════════════════════════════════════════════════════════
-# Encoder
-# ══════════════════════════════════════════════════════════════
-
 class ContrastiveEncoder(nn.Module):
     def __init__(self, vocab_size, d_model=128, nhead=4, num_layers=2, proj_dim=64):
         super().__init__()
@@ -107,37 +96,28 @@ class ContrastiveEncoder(nn.Module):
         x = self.embedding(src)
         memory = self.encoder(x, src_key_padding_mask=padding_mask)
 
-        # كل quadruple = [day, hour, device, action]
-        # positions 2,3,6,7,10,11,... هي الـ device+action tokens
-        # دول الأهم للـ anomaly detection
         B, L, D = memory.shape
         device_action_mask = torch.zeros(B, L, device=memory.device)
-        for pos in range(2, L, 4):   # device token
-            device_action_mask[:, pos] = 3.0   # وزن أعلى للـ device
-        for pos in range(3, L, 4):   # action token
-            device_action_mask[:, pos] = 3.0   # وزن أعلى للـ action
-        for pos in range(0, L, 4):   # day token
+        for pos in range(2, L, 4):   
+            device_action_mask[:, pos] = 3.0   
+        for pos in range(3, L, 4):   
+            device_action_mask[:, pos] = 3.0   
+        for pos in range(0, L, 4):   
             device_action_mask[:, pos] = 1.0
-        for pos in range(1, L, 4):   # hour token
+        for pos in range(1, L, 4):   
             device_action_mask[:, pos] = 1.0
 
-        # بنطبق الـ padding mask
         if padding_mask is not None:
             valid = (~padding_mask).float()
             device_action_mask = device_action_mask * valid
 
-        # Weighted pooling
-        weights = device_action_mask.unsqueeze(-1)           # [B, L, 1]
+        weights = device_action_mask.unsqueeze(-1)           
         pooled = (memory * weights).sum(1) / weights.sum(1).clamp(min=1e-9)
         return pooled
 
     def forward(self, src, padding_mask=None):
         return self.projector(self.encode(src, padding_mask))
 
-
-# ══════════════════════════════════════════════════════════════
-# Augmentation
-# ══════════════════════════════════════════════════════════════
 
 def augment(src, vocab_size, mask_prob=0.2, crop_prob=0.1):
     src = src.clone()
@@ -167,10 +147,6 @@ def simclr_loss(z1, z2, temperature=0.07):
     return F.cross_entropy(sim, labels)
 
 
-# ══════════════════════════════════════════════════════════════
-# Training
-# ══════════════════════════════════════════════════════════════
-
 def train_contrastive(new_env, vocab_size, train_file, model_save_path,
                       epochs=100, lr=1e-4, temperature=0.07):
     ensure_dir_exists(model_save_path)
@@ -178,7 +154,6 @@ def train_contrastive(new_env, vocab_size, train_file, model_save_path,
     with open(train_file, 'rb') as f:
         all_seqs = pickle.load(f)
 
-    # بنستخدم كل الـ data في batch واحد لو صغيرة
     batch_size = min(64, len(all_seqs))
     loader = make_data(new_env, vocab_size, train_file,
                        batch_size=batch_size, shuffle=True)
@@ -226,10 +201,6 @@ def train_contrastive(new_env, vocab_size, train_file, model_save_path,
     print(f"✓ Saved → {model_save_path}  (best loss: {best_loss:.4f})\n")
 
 
-# ══════════════════════════════════════════════════════════════
-# Embeddings
-# ══════════════════════════════════════════════════════════════
-
 def _load_model(path, vocab_size):
     m = ContrastiveEncoder(vocab_size).to(device)
     m.load_state_dict(torch.load(path, map_location=device))
@@ -249,37 +220,86 @@ def collect_embeddings(new_env, vocab_size, data_file, model_path, batch_size=64
     return np.vstack(all_emb)
 
 
-# ══════════════════════════════════════════════════════════════
-# One-Class SVM Detection
-# ══════════════════════════════════════════════════════════════
-
-def build_ocsvm(normal_emb, nu=0.1):
+def build_ocsvm(normal_emb, nu=0.2, gamma=1.0):
     """
     One-Class SVM على الـ normal embeddings.
-    nu = الـ upper bound على الـ fraction of outliers في الـ training data.
-    قيمة صغيرة = أكثر صرامة.
+
+    nu    = الـ upper bound على نسبة الـ outliers المسموح بيها في التدريب.
+    gamma = معامل الـ RBF kernel، بيحدد اتساع تأثير كل sample.
+
+    ملاحظة مهمة (من التشخيص):
+    gamma='scale' الافتراضي بيتحسب كـ 1/(n_features * variance).
+    مع embeddings عالية الأبعاد (128-dim) و normal samples كتير،
+    القيمة الناتجة بتبقى صغيرة جداً، فالـ kernel بيبقى واسع جداً
+    ومش بيميز التفاصيل الدقيقة بين normal و anomaly.
+
+    الحل: gamma=1.0 (أعلى بكتير من scale) بيخلي الـ kernel
+    أكثر تركيزاً حول كل sample، فبيقدر يميز الفروق الدقيقة.
     """
     scaler = StandardScaler()
     X = scaler.fit_transform(normal_emb)
 
-    ocsvm = OneClassSVM(kernel='rbf', nu=nu, gamma='scale')
+    ocsvm = OneClassSVM(kernel='rbf', nu=nu, gamma=gamma)
     ocsvm.fit(X)
 
-    # تحقق على الـ normal data نفسها
     preds = ocsvm.predict(X)
     normal_acc = (preds == 1).mean()
     print(f"\n── One-Class SVM ──────────────────────────────────────")
     print(f"  Normal samples    : {len(normal_emb)}")
     print(f"  nu                : {nu}")
+    print(f"  gamma             : {gamma}")
     print(f"  Normal data accuracy: {normal_acc:.2%}  (المفروض قريب من {1-nu:.0%})")
     print(f"──────────────────────────────────────────────────────\n")
 
     return ocsvm, scaler
 
 
-# ══════════════════════════════════════════════════════════════
-# Evaluation
-# ══════════════════════════════════════════════════════════════
+def auto_tune_ocsvm(normal_emb, val_split=0.2, seed=2024):
+    """
+    بيختار أحسن nu و gamma تلقائياً:
+      1. تقسيم الـ normal embeddings لـ train/validation
+      2. تدريب الـ OC-SVM على الـ train بقيم مختلفة
+      3. اختيار القيم اللي بتحقق acceptance rate على الـ validation
+         قريب من النسبة المتوقعة (1-nu)
+
+    ده unsupervised بالكامل، مش محتاج attack data في الاختيار.
+    """
+    n = len(normal_emb)
+    rng = np.random.RandomState(seed)
+    idx = rng.permutation(n)
+    split = int(n * (1 - val_split))
+    train_idx, val_idx = idx[:split], idx[split:]
+
+    X_train_raw = normal_emb[train_idx]
+    X_val_raw = normal_emb[val_idx]
+
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X_train_raw)
+    X_val = scaler.transform(X_val_raw)
+
+    candidates = []
+    for nu in [0.1, 0.15, 0.2, 0.3]:
+        for gamma in [0.1, 0.5, 1.0, 2.0]:
+            ocsvm = OneClassSVM(kernel='rbf', nu=nu, gamma=gamma)
+            ocsvm.fit(X_train)
+            val_preds = ocsvm.predict(X_val)
+            val_acc = (val_preds == 1).mean()
+            target = 1 - nu
+            score = -abs(val_acc - target)
+            candidates.append((nu, gamma, val_acc, score))
+
+    candidates.sort(key=lambda x: -x[3])
+    best_nu, best_gamma, best_acc, _ = candidates[0]
+
+    print(f"\n── Auto-Tuning OC-SVM (validation-based) ──────────────")
+    print(f"  Tried {len(candidates)} (nu, gamma) combinations")
+    print(f"  Best nu    : {best_nu}")
+    print(f"  Best gamma : {best_gamma}")
+    print(f"  Val acceptance rate: {best_acc:.2%}")
+    print(f"──────────────────────────────────────────────────────\n")
+
+    return best_nu, best_gamma
+
 
 def evaluate(new_env, vocab_size, test_file1, test_file3,
              model_path, ocsvm, scaler):
@@ -346,10 +366,6 @@ def evaluate(new_env, vocab_size, test_file1, test_file3,
     return TP, TN, FP, FN, FPR, FNR, recall, precision, accuracy, f1
 
 
-# ══════════════════════════════════════════════════════════════
-# Main Pipeline
-# ══════════════════════════════════════════════════════════════
-
 def Anomaly_detection(dataset, new_env, thres, method, model,
                       percentage, k=10, cl_epochs=50):
     setup_seed(2024)
@@ -364,8 +380,6 @@ def Anomaly_detection(dataset, new_env, thres, method, model,
     if new_env == 'multiple':
         train_file = vld_file = data_file
     else:
-        # بنقسم الـ real test normal data لـ train/val
-        # عشان الـ model يتعلم على نفس distribution الـ test data
         real_test_file = f'IoT_data/{dataset}/{new_env}/split_test.pkl'
         train_file = f'IoT_data/{dataset}/{new_env}/trn.pkl'
         vld_file   = f'IoT_data/{dataset}/{new_env}/rs_vld.pkl'
@@ -380,13 +394,11 @@ def Anomaly_detection(dataset, new_env, thres, method, model,
 
     test_file3 = f"IoT_data/{dataset}/{new_env}/split_test.pkl"
 
-    # Step 1: Train
     print("=" * 55)
     print("  Step 1: Contrastive Training on Normal Data")
     print("=" * 55)
     train_contrastive(new_env, vocab_size, train_file, model_path, epochs=cl_epochs)
 
-    # Step 2: Embeddings
     print("=" * 55)
     print("  Step 2: Extracting Normal Embeddings")
     print("=" * 55)
@@ -395,16 +407,12 @@ def Anomaly_detection(dataset, new_env, thres, method, model,
     normal_emb = np.vstack([train_emb, val_emb])
     print(f"  Normal embeddings: {normal_emb.shape}")
 
-    # Step 3: One-Class SVM
     print("=" * 55)
     print("  Step 3: Building One-Class SVM Detector")
     print("=" * 55)
-    # nu في OC-SVM = نسبة الـ outliers المسموح بيها في الـ training
-    # بنستخدم قيمة أكبر عشان الـ SVM يبقى أقل صرامة على الـ normal data
-    nu = 0.2
-    ocsvm, scaler = build_ocsvm(normal_emb, nu=nu)
+    best_nu, best_gamma = auto_tune_ocsvm(normal_emb)
+    ocsvm, scaler = build_ocsvm(normal_emb, nu=best_nu, gamma=best_gamma)
 
-    # Step 4: Evaluate
     print("=" * 55)
     print("  Step 4: Evaluation")
     print("=" * 55)
