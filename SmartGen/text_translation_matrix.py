@@ -348,7 +348,7 @@ def ATM(dataset: str, ori_env: str, actions: Dict[str, int]) -> Dict:
         for sublist in data
     ]
 
-    file_name = f"GSS_Json/action_transitions.json"
+    file_name = f'IoT_data/{dataset}/{ori_env}/action_transitions.json'
     hints = analyze_link(sequences, actions, file_name)
 
     print("\n--- LLM hints ---")
