@@ -17,6 +17,8 @@ from extract import Extract
 from find_categories import Find_categories
 from security_check import security_check
 from SAS_main import SASRec_behavior_prediction
+from TOF import filter_generated_sequences
+
 
 vocab_dic = {"an": 141, "fr": 223, "us": 269, "sp": 235}
 device_dic = {"us": us_devices_dict, "fr": fr_devices_dict, "sp": sp_devices_dict}
@@ -43,6 +45,13 @@ def get_args_parser():
                         help='The experimental setup: True/False')
     parser.add_argument('--need_generate', default=False, type=bool,
                         help='The experimental setup: True/False')
+    parser.add_argument('--use_tof', default=True, type=bool,
+                        help='Apply TOF filtering to generated sequences')
+    parser.add_argument('--tof_contamination', default=0.05, type=float,
+                        help='TOF contamination parameter')
+    parser.add_argument('--tof_min_value', default=0.4, type=float,
+                        help='TOF minimum value threshold')
+    
     return parser
 
 
@@ -155,8 +164,17 @@ if __name__ == "__main__":
 
         Extract(args.dataset, args.new_env, args.threshold, args.method, args.model, all_categories)
         Transnum(args.dataset, args.new_env, args.threshold, args.method, args.model, all_categories, dictionaries)
-        security_check(args.dataset, args.new_env, args.threshold, args.method, args.model)
-
+        # security_check(args.dataset, args.new_env, args.threshold, args.method, args.model)
+        if args.use_tof:
+            filter_generated_sequences(
+                args.dataset, 
+                args.new_env, 
+                args.threshold, 
+                args.method, 
+                args.model,
+                contamination=args.tof_contamination,
+                min_value=args.tof_min_value
+            )
 
     if args.need_test:
         Anomaly_detection(args.dataset, args.new_env, args.threshold, args.method, args.model, args.percentage)
