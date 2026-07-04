@@ -325,11 +325,10 @@ def SPPC_select(dataset, ori_env, vocab_size, threshold,
             representations, text_collection, n_clusters=n_clusters
         )
 
-        print(f"  Final GSS input: {len(representative_sequences)} sequences")
 
  
         out_path = (f'IoT_data/{dataset}/{ori_env}/'
-                    f'trn_day_{day}_CL_CC_for_GSS.pkl')
+                    f'trn_day_{day}/trn_day_{day}_SPPC_th={threshold}.pkl')
         with open(out_path, 'wb') as f_out:
             pickle.dump(representative_sequences, f_out)
 
